@@ -1,0 +1,7 @@
+openai
+pandas
+matplotlib
+numpy
+SpeechRecognition
+pyttsx3
+pytest
