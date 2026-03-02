@@ -1,0 +1,183 @@
+Fixed Bot Code + Instructions
+This document contains a corrected, well-indented version of your bot code (as a reference),
+a clear explanation of which variables represent what, and an explicit instruction for the bot
+to append a Python fenced code block at the end of every assistant reply that updates
+summary_memory (and optionally project_context). A small dummy-bot example is included too.
+
+1) Corrected Bot Code (reference)
+
+# Fixed bot implementation (uses module-level globals but keeps class methods to update them)
+import requests
+import os
+import pandas as pd
+
+# module-level globals (contract expects these)
+conversation_history = []   # list of {"role": "user"/"assistant", "content": "..."}
+project_context = []        # list of project-context entries (dicts or strings)
+summary_memory = ""         # short string summary of recent conversation / state
+
+class Bot:
+    def __init__(self, api_key: str, endpoint: str, dataset_path: str = None):
+        self.api_key = api_key
+        self.endpoint = endpoint
+        self.dataset_path = dataset_path
+        # keep a local handle but rely on module-level globals as the single source-of-truth
+        # so other modules / code can read project_context / summary_memory
+        self.system_context = (
+            "You are an analytical assistant. Always update project_context and summary_memory "
+            "when asked. If you emit code blocks, mark them with ```python``` fences."
+        )
+
+    def build_context(self):
+        """
+        Build the `messages` payload expected by the chat completion API. This function reads
+        the module-level globals and returns a list of message dicts.
+        """
+        messages = []
+        messages.append({"role": "system", "content": self.system_context})
+        # include a brief machine-readable snapshot of project_context / summary_memory
+        messages.append({"role": "system", "content": f"Project context: {project_context}"})
+        messages.append({"role": "system", "content": f"Summary memory: {summary_memory}"})
+        # append the conversation history (already in the format role/content)
+        messages.extend(conversation_history)
+        return messages
+
+    def update_project_context(self, new_entries: dict):
+        """
+        Add a new entry (or entries) to project_context. Keep this minimal and explicit.
+        """
+        global project_context
+        # allow dict or list input
+        if isinstance(new_entries, dict):
+            project_context.append(new_entries)
+        elif isinstance(new_entries, list):
+            project_context.extend(new_entries)
+        else:
+            project_context.append({"note": str(new_entries)})
+
+    def set_summary_memory(self, text: str):
+        """
+        Replace the summary memory with a short string.
+        """
+        global summary_memory
+        summary_memory = str(text)
+
+    def send_message(self, message: str, max_tokens: int = 1500, temperature: float = 0.2):
+        """
+        Append user message to conversation_history, call the API, and process the assistant reply.
+        """
+        global conversation_history
+        conversation_history.append({"role": "user", "content": message})
+
+        payload = {
+            "model": "openai/gpt-oss-120b",
+            "messages": self.build_context(),
+            "max_tokens": max_tokens,
+            "temperature": temperature
+        }
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+
+        response = requests.post(self.endpoint, json=payload, headers=headers)
+        print("API response status:", response.status_code)
+
+        if response.status_code == 200:
+            response_data = response.json()
+            bot_reply = response_data['choices'][0]['message']['content']
+            # append assistant reply to global conversation history
+            conversation_history.append({"role": "assistant", "content": bot_reply})
+            # try to extract & execute first python fenced block (if present)
+            exec_result = self.execute_code_with_delimiters(bot_reply)
+            return {"reply": bot_reply, "exec_result": exec_result}
+        else:
+            return {"error": f"Error: {response.status_code} - {response.text}"}
+
+    def execute_code_with_delimiters(self, text: str):
+        """
+        Extract the first fenced ```python``` block from `text`, execute it in module globals,
+        and return a dict describing the result.
+        """
+        try:
+            start_marker = "```python"
+            end_marker = "```"
+            start_index = text.find(start_marker)
+            if start_index == -1:
+                return {"status": "no_code_block_found"}
+
+            start_index += len(start_marker)
+            end_index = text.find(end_marker, start_index)
+            if end_index == -1:
+                return {"status": "no_closing_fence"}
+
+            code_str = text[start_index:end_index].strip()
+            # Execute in module globals so executed code can update project_context/summary_memory
+            exec(code_str, globals())
+            return {"status": "executed", "code": code_str}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+2) Who is who (clear explanation)
+conversation_history (module-level list):
+  - Holds the whole chat as a list of {'role': 'user'|'assistant', 'content': '...'} entries.
+
+project_context (module-level list):
+  - Structured list where the bot stores dataset summaries, data.info(), columns, missing-value summaries, or other project-specific notes. Use dictionaries for clarity, e.g. {'data_info': '...'}.
+
+summary_memory (module-level string):
+  - Short, human-readable summary of the recent conversation or the agent's state. Keep it concise (one or two sentences).
+
+Design rules:
+  - Choose module-level globals as the single source-of-truth (so other tools or processes can read them).
+  - Inside the Bot class, always use `global` to modify these globals (e.g. global project_context) or provide wrapper methods.
+
+3) How the assistant should append a python block after each reply
+Rule: Every assistant (bot) reply SHOULD end with a python fenced code block that updates summary_memory and, if needed, project_context.
+
+Format example (exactly like this):
+
+
+```python
+# short summary string — one or two sentences
+summary_memory = "user asked about dataset ingestion; instructed bot to extract columns and missing values"
+
+# optional: add a compact project context entry (dict) so code can persist structured info
+project_context.append({
+    "note": "added dataset summary",
+    "columns": ["age", "sex", "cp", "..."],
+    "missing_values": {"age": 0, "chol": 2}
+})
+```
+
+4) Dummy bot that demonstrates the behavior
+
+# Dummy generator that composes text and always appends the python block described above.
+def dummy_bot_reply(user_text: str):
+    # Compose the normal human-readable reply
+    reply_text = f"hey, received your message: {user_text}\n\n"
+    reply_text += "I have your project context and can update summary_memory now.\n\n"
+    # Append the python fenced block that will be executed by the system when present
+    python_block = """```python
+summary_memory = "user asked a question about the bot; bot confirmed it has project_context"
+project_context.append({"note": "dummy update", "user_text_sample": "%s"})
+```""" % user_text.replace('"', "'")
+    return reply_text + python_block
+
+# Example usage:
+print(dummy_bot_reply("kya mere pass project context hai?"))
+
+5) Example conversation snippet (as you requested)
+User: heyy kya haal hai.
+
+Assistant (human-readable): kya mere pass project context hai? haan hai abh me user se baat kar sakta hoon.
+
+Assistant (python block appended):
+```python
+summary_memory = "user ne mera haalchal pucha; bot will record that it's doing fine and cares"
+project_context.append({'note': 'assistant greeted user and confirmed project_context'})
+```
+
+Assistant continues human-readable text: haan mera haal toh bhadiyan aapse mil k kafi dil khus ho gaya.
+
